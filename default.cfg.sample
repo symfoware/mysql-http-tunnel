@@ -1,0 +1,8 @@
+[virtual_user_name]
+endpoint = https://www.example.com/proxy.php
+host = localhost
+database = sample
+charset = utf8mb4
+user = dbuser
+password = P@ssw0rd
+
