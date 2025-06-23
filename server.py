@@ -66,9 +66,11 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         client = Client(rec)
         
         # ユーザー名のセクションがcfgに存在するかチェック
-        if client.user in self.servers:
+        if client.vuser in self.servers:
             logging.info('--> OK')
+            client.set_setting(self.servers[client.vuser])
             self.request.sendall(OkPacket(Sequence(client.sequence)).make())
+            print(client)
         else:
             logging.info('--> USER ERROR')
             error = ErrorPacket(Sequence(client.sequence)) \
@@ -138,7 +140,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         
         # field packet
         for col in result['cols']:
-            body.extend(FieldPacket(seq).make(col))
+            body.extend(FieldPacket(seq).make(client, col))
 
         # CLIENT_DEPRECATE_EOFがoffならcolとrowの間にokパケットを挟む
         if not client.deprecate_eof:
@@ -160,16 +162,14 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
 
     # サーバー上のPHPを呼び出しクエリー実行
     def fetch(self, client, query):
-        setting = self.servers[client.user]
-
-        url = setting['endpoint']
+        url = client.endpoint
         # 送信パラメーター
         data = {
-            'host': setting['host'],
-            'database': setting['database'],
-            'charset': setting['charset'],
-            'user': setting['user'],
-            'password': setting['password'],
+            'host': client.host,
+            'database': client.database,
+            'charset': client.charset,
+            'user': client.user,
+            'password': client.password,
             'query': query,
         }
 
@@ -324,11 +324,11 @@ class ColumnCountPacket(Packet):
 
 # 列名情報
 class FieldPacket(Packet):
-    def make(self, col):
+    def make(self, client, col):
         # catalog
         self.extend(self.string_lenenc('def')) # def固定
         # schema
-        self.extend(self.string_lenenc('sample')) # selectを実行したデータベース名と一致させる
+        self.extend(self.string_lenenc(client.database)) # selectを実行したデータベース名と一致させる
         # table
         self.extend(self.string_lenenc(col['table']))
         # org_table
@@ -431,7 +431,7 @@ class Client(object):
         
         filler = protcol[9:9+23]
         
-        self.user, user_len = self.read_string_nul(protcol[32:])
+        self.vuser, user_len = self.read_string_nul(protcol[32:])
         # 以降、付帯情報 特に使用していないので読み捨て
         protcol = protcol[32+user_len:]
 
@@ -451,6 +451,12 @@ class Client(object):
     def read_string_nul(self, value):
         nul_index = value.find(0x00)
         return value[:nul_index].decode('utf-8'), nul_index+1
+
+    
+    def set_setting(self, setting):
+        for k, v in setting.items():
+            print(k, v)
+            setattr(self, k, v)
 
 
 # クライアントからのリクエスト解析
