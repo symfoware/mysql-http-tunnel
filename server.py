@@ -70,7 +70,6 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             logging.info('--> OK')
             client.set_setting(self.servers[client.vuser])
             self.request.sendall(OkPacket(Sequence(client.sequence)).make())
-            print(client)
         else:
             logging.info('--> USER ERROR')
             error = ErrorPacket(Sequence(client.sequence)) \
@@ -455,7 +454,6 @@ class Client(object):
     
     def set_setting(self, setting):
         for k, v in setting.items():
-            print(k, v)
             setattr(self, k, v)
 
 
