@@ -377,13 +377,13 @@ class FieldPacket(Packet):
 
 
     def field_flag(self, flags):
-        flags = {
+        flag_values = {
            'not_null':1,  'primary_key':2, 'unique_key':4, 'multiple_key':8, 'blob': 16,
            'unsigned':32, 'zerofill':64, 'binary':128
         }
 
         flag = 0
-        for k, v in flags.items():
+        for k, v in flag_values.items():
             if k in flags:
                 flag += v
 
@@ -503,7 +503,7 @@ class Request(object):
 
 # ------------------------------------------------------------------
 def main():
-    HOST, PORT = 'localhost', 13306
+    HOST, PORT = '0.0.0.0', 13306
 
     logging.basicConfig(
         level=logging.DEBUG,
