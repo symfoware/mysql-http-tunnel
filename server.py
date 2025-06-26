@@ -5,6 +5,7 @@ import struct
 import zlib
 import logging
 import configparser
+import datetime
 
 import json
 import urllib.request
@@ -15,6 +16,9 @@ CONFIG_FILE_NAME = 'default.cfg'
 COM_QUERY = 0x03
 COM_PING = 0x0e
 COM_QUIT = 0x01
+COM_STMT_PREPARE = 0x16
+COM_STMT_EXECUTE = 0x17
+COM_STMT_CLOSE = 0x19
 
 # ------------------------------------------------------------------
 # TCPServer
@@ -89,7 +93,8 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             request = Request(rec, client)
             # コマンドに対応するレスポンス生成
             response = self.execute_command(request, client)
-            self.request.sendall(response)
+            if response:
+                self.request.sendall(response)
 
             if request.command == COM_QUIT:
                 logging.info('Bye.')
@@ -104,6 +109,18 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         # -- Text Protocol
         if request.command == COM_QUERY: # COM_QUERY
             response = self.execute_query(request, client)
+        
+        # -- Prepared Statements
+        elif request.command == COM_STMT_PREPARE: # COM_STMT_PREPARE
+            response = self.execute_prepare(request, client)
+
+        elif request.command == COM_STMT_EXECUTE: # COM_STMT_EXECUTE
+            request.query = 'SELECT id,name,email FROM users WHERE id = 2'
+            response = self.execute_prepare_query(request, client)
+
+        elif request.command == COM_STMT_CLOSE: # COM_STMT_CLOSE
+            client.prepare = None
+            response = None
 
         # SQL実行以外は一律OKパケットを応答
         else:
@@ -119,7 +136,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         seq = Sequence(request.sequence)
         # proxy.php経由でSQL文実行
         result = self.fetch(client, request.query)
-        
+        logging.debug(result)
         
         if result['state']:
             # ERR_Packetを返却
@@ -158,9 +175,91 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
 
         return body
 
+    
+    # プリペアードステートメント実行
+    def execute_prepare_query(self, request, client):
+
+        seq = Sequence(request.sequence)
+        # proxy.php経由でSQL文実行
+        result = self.fetch(client, client.prepare['query'], request.binds)
+        
+        if result['state']:
+            # ERR_Packetを返却
+            logging.info('--> Error')
+            return ErrorPacket(seq).make(result['code'], result['state'], result['message'])
+
+        # カラム数がない場合はOKパケット返信
+        if not result['cols']:
+            logging.info('--> OK')
+            return OkPacket(seq).make(affected=result['affected'], last_insert_id=result['last_insert_id'])
+        
+        logging.info('--> Prepare Result')
+
+        body = bytearray()
+        # column_count
+        body.extend(ColumnCountPacket(seq).make(len(result['cols'])))
+        
+        # field packet
+        for col in result['cols']:
+            body.extend(FieldPacket(seq).make(client, col))
+
+        # intermediate eof
+        body.extend(EofPacket(seq).make())
+
+        # row packet
+        for row in result['rows']:
+            body.extend(BinaryRowPacket(seq).make(row, result['cols']))
+
+        # response eof
+        body.extend(EofPacket(seq).make())
+            
+
+        return body
+
+    
+    # プリペアードステートメント解析
+    def execute_prepare(self, request, client):
+
+        logging.info('--> Prepare OK')
+
+        seq = Sequence(request.sequence)
+
+        body = bytearray()
+
+        # パラメーター数は仮で「?」をカウント
+        # @todo カウント方法を検討
+        num_params = request.query.count('?')
+        num_columns = 1
+        client.prepare = {
+            'query': request.query,
+            'num_params': num_params
+        }
+        # prepare ok
+        body.extend(PrepareOkPacket(seq).make(client, num_columns, num_params))
+
+        # バインドするカラム数の枠が必要
+        # params
+        col = {'table':'', 'name':'?', 'len':21, 'native_type':'LONGLONG', 'flags':[], 'precision':0} # ダミーの列定義
+        for i in range(num_params):
+            body.extend(FieldPacket(seq).make(client, col))
+
+        # intermediate eof
+        body.extend(EofPacket(seq).make())
+        # field packet
+        # num_columnsと一致させる
+        # 結果セットを返すクエリーなのに0だとドライバー側でパケット解析に失敗しエラーになる
+        body.extend(FieldPacket(seq).make(client, col))
+
+        # response eof
+        body.extend(EofPacket(seq).make())
+
+        return body
+
+
+
 
     # サーバー上のPHPを呼び出しクエリー実行
-    def fetch(self, client, query):
+    def fetch(self, client, query, binds=None):
         url = client.endpoint
         # 送信パラメーター
         data = {
@@ -170,7 +269,11 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             'user': client.user,
             'password': client.password,
             'query': query,
+            'mode' : 'text'
         }
+        if binds:
+            data['binds'] = binds
+            data['mode'] = 'prepare'
 
         # 送信パラメーターをjsonに変換
         jsondata = json.dumps(data)
@@ -399,13 +502,106 @@ class RowPacket(Packet):
         return self.pack()
 
 
+class BinaryRowPacket(Packet):
+    def make(self, row, cols):
+        
+        self.extend(struct.pack('<B', 0)) # ok
+        nulls = self.calcnull(row)
+        for n in nulls: # null bitmap
+            self.extend(struct.pack('<B', n))
+
+        for data, col in zip(row, cols):
+            if not data: # NULLは読み飛ばし
+                continue
+
+            ntype = col['native_type']
+            if ntype == 'LONGLONG': # 8 bytes
+                self.extend(struct.pack('<Q', int(data)))
+            elif ntype == 'LONG': # 4 bytes
+                self.extend(struct.pack('<I', int(data)))
+            elif ntype == 'SHORT' or ntype == 'YEAR': # 2 bytes
+                self.extend(struct.pack('<H', int(data)))
+            elif ntype == 'TINY': # 1 bytes
+                self.extend(struct.pack('<B', int(data)))
+
+            elif ntype == 'VAR_STRING':
+                self.extend(self.string_lenenc(data))
+
+            elif ntype == 'TIMESTAMP':
+                self.make_timestamp(data)
+
+            else:
+                logging.error('BinaryRowPacket:not type -> ' + ntype)
+            
+
+        return self.pack()
+
+    def calcnull(self, row):
+        # nullを格納するのに必要なバイト数を求める
+        offset = 2 # 2固定
+        num_fields = len(row) # 結果のフィールド数
+        bitmap_bytes = int((num_fields + 7 + offset) / 8)
+        # 必要な領域を確保
+        nulls = [0 for i in range(bitmap_bytes)]
+        for field_pos,value in enumerate(row):
+            if value:
+                continue
+
+            # 格納する値の計算
+            byte_pos = int((field_pos + offset) / 8)
+            bit_pos  = (field_pos + offset) % 8
+            nulls[byte_pos] |= 1 << bit_pos
+        
+        return nulls
+
+    def make_timestamp(self, data):
+        tsize = len(data)
+        if tsize == 10:
+            dt = datetime.datetime.strptime(data, '%Y-%m-%d')
+            self.extend(struct.pack('<B', 4)) # size
+            self.extend(struct.pack('<HBB', dt.year, dt.month, dt.day))
+
+        elif tsize == 19:
+            dt = datetime.datetime.strptime(data, '%Y-%m-%d %H:%M:%S')
+            self.extend(struct.pack('<B', 7)) # size
+            self.extend(struct.pack('<HBB', dt.year, dt.month, dt.day))
+            self.extend(struct.pack('<BBB', dt.hour, dt.minute, dt.second))
+            
+        elif tsize >= 23:
+            dt = datetime.datetime.strptime(data, '%Y-%m-%d %H:%M:%S.%f')
+            self.extend(struct.pack('<B', 11)) # size
+            self.extend(struct.pack('<HBB', dt.year, dt.month, dt.day))
+            self.extend(struct.pack('<BBBB', dt.hour, dt.minute, dt.second, dt.microsecond))
+
+        else:
+            self.extend(struct.pack('<B', 0))
+            logging.warn('Unmatch timestamp:' + data)
+
+
+# PREPARE Response
+class PrepareOkPacket(Packet):
+    def make(self, client, num_columns, num_params):
+        self.extend(struct.pack('<B', 0x00)) # ok 0x00
+        self.extend(struct.pack('<I', 1)) # statement_id
+        self.extend(struct.pack('<H', num_columns)) # num_columns
+        self.extend(struct.pack('<H', num_params)) # num_params
+        self.extend(struct.pack('<B', 0)) # reserved_1 0X00 filler
+
+        self.extend(struct.pack('<H', 0)) # warning_count
+
+        if client.resultset_metadata:
+            self.extend(struct.pack('<B', 0)) # metadata_follows
+
+        return self.pack()    
+
+
 class EofPacket(Packet):
     def make(self):
         # eof
         self.extend(struct.pack('<B', 0xfe)) # eof 0xFE
         self.extend(struct.pack('<H', 0)) # affected_rows
         self.extend(struct.pack('<H', 2)) # SERVER_STATUS_flags_enum
-        self.extend(struct.pack('<H', 0)) # number of warnings
+        #self.extend(struct.pack('<H', 0)) # number of warnings
 
         return self.pack()
 
@@ -416,6 +612,7 @@ class EofPacket(Packet):
 class Client(object):
     def __init__(self, packet):
         self.parse(packet)
+        self.prepare = None
 
     def parse(self, packet):
         # 3byte size
@@ -436,11 +633,16 @@ class Client(object):
 
         # フラグにより有効な機能を判定
         self.deprecate_eof = False
+        self.resultset_metadata = False
         self.query_attributes = False
 
         CLIENT_DEPRECATE_EOF = 1 << 24
         if self.client_flag & CLIENT_DEPRECATE_EOF == CLIENT_DEPRECATE_EOF:
             self.deprecate_eof = True
+
+        CLIENT_OPTIONAL_RESULTSET_METADATA = 1 << 25
+        if self.client_flag & CLIENT_OPTIONAL_RESULTSET_METADATA == CLIENT_OPTIONAL_RESULTSET_METADATA:
+            self.resultset_metadata = True
 
         CLIENT_QUERY_ATTRIBUTES = 1 << 27
         if self.client_flag & CLIENT_QUERY_ATTRIBUTES == CLIENT_QUERY_ATTRIBUTES:
@@ -490,6 +692,51 @@ class Request(object):
             self.query = protcol[1+shift:].decode('utf-8').strip()
             logging.info(self.query)
 
+        # -- Prepared Statements
+        elif self.command == COM_STMT_PREPARE: # COM_STMT_PREPARE
+            logging.info('<-- COM_STMT_PREPARE')
+            self.query = protcol[1:].decode('utf-8').strip()
+            logging.info(self.query)
+
+        elif self.command == COM_STMT_EXECUTE: # COM_STMT_EXECUTE
+            logging.info('<-- COM_STMT_EXECUT')
+            protcol = protcol[1:]
+            statement_id, self.flags, iteration_count = struct.unpack('<IBI', protcol[0:9])
+            protcol = protcol[9:]
+            # ここで条件によってはparameter_countが入る
+            # https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_execute.html
+            # fillerを読み飛ばし
+            protcol = protcol[1:]
+            new_params_bind_flag = protcol[0]
+            protcol = protcol[1:]
+            self.binds = []
+            bind_types = []
+            
+            # 最初にデータ型がnum_params分格納
+            for i in range(client.prepare['num_params']):
+                if not len(protcol):
+                    logging.error('COM_STMT_EXECUTE binds data type is short.')
+                    break
+
+                ftype, = struct.unpack('<H', protcol[0:2])
+                bind_types.append(ftype)
+                protcol = protcol[2:]
+
+            # 続いて値がnum_params分格納
+            for i in range(client.prepare['num_params']):
+                if not len(protcol):
+                    logging.error('COM_STMT_EXECUTE binds data value is short.')
+                    break
+
+                value, size = self.string_lenenc(protcol)
+                protcol = protcol[size:]
+                self.binds.append(value)
+
+
+        
+        elif self.command == COM_STMT_CLOSE: # COM_STMT_CLOSE
+            logging.info('<-- COM_STMT_EXECUT')
+
         
         # -- Utility Commands
         elif self.command == COM_QUIT: # COM_QUIT
@@ -503,6 +750,18 @@ class Request(object):
             logging.error(protcol)
             
 
+    def string_lenenc(self, data):
+        if not len(data):
+            return ('', 0)
+
+        # @todo size parse
+        size = 0
+        value = ''
+        if data[0] < 0xfb:
+            size = data[0] + 1
+            value = data[1:size].decode('utf-8')
+
+        return (value, size)
 
 
 # ------------------------------------------------------------------

@@ -26,18 +26,22 @@ $affected = 0;
 
 try {
     $pdo = new PDO($dsn, $user, $password);
-} catch (PDOException $e) {
-    list($state, $code, $message) = $e->errorInfo;
-    send_response([
-        'state' => $state,
-        'code' => $code,
-        'message' => $message,
-    ]);
-}
+    $stmt = null;
 
-try {
     // SQL実行
-    $stmt = $pdo->query($query);
+    if (isset($request['mode']) && ($request['mode'] == 'prepare')) {
+        $stmt = $pdo->prepare($query, [PDO::ATTR_CURSOR => PDO::CURSOR_FWDONLY]);
+        
+        foreach($request['binds'] as $index => &$value) {
+            // 参照を渡す必要あり
+            $stmt->bindParam($index+1, $value);
+        }
+        $stmt->execute();
+        
+    } else {
+        $stmt = $pdo->query($query);
+    }
+    
 
     // カラム数取得
     $columnCount = $stmt->columnCount();

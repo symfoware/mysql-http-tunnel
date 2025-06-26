@@ -83,6 +83,9 @@ SQL実行に必要な最低限のコマンドのみ対応しています
 - COM_QUERY
 - COM_PING
 - COM_QUIT
+- COM_STMT_PREPARE
+- COM_STMT_EXECUTE
+- COM_STMT_CLOSE
 
 ## 既知の問題
 
@@ -109,6 +112,9 @@ HeidiSQLからデータのあるテーブルのバックアップを行うとエ
 [COM_QUERY](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query.html)  
 [COM_PING](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_ping.html)  
 [COM_QUIT](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_quit.html)  
+[COM_STMT_PREPARE](https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_prepare.html)  
+[COM_STMT_EXECUTE](https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_execute.html)  
+[COM_STMT_CLOSE](https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_close.html)
 
 #### サーバーからの応答
 
@@ -118,6 +124,8 @@ HeidiSQLからデータのあるテーブルのバックアップを行うとエ
 [Text Resultset](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html)  
 [Protocol::ColumnDefinition41](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html)  
 [Text Resultset Row](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_row.html)  
+[COM_STMT_PREPARE Response](https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_prepare.html#sect_protocol_com_stmt_prepare_response_ok)  
+[Binary Protocol Resultset](https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_binary_resultset.html)  
 
 #### 定数等
 
