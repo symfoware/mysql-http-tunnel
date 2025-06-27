@@ -93,10 +93,9 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             request = Request(rec, client)
             # コマンドに対応するレスポンス生成
             response = self.execute_command(request, client)
-            if response:
-                self.request.sendall(response)
+            self.request.sendall(response)
 
-            if request.command == COM_QUIT:
+            if request.command in [COM_QUIT]:
                 logging.info('Bye.')
                 break
 
@@ -115,12 +114,11 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             response = self.execute_prepare(request, client)
 
         elif request.command == COM_STMT_EXECUTE: # COM_STMT_EXECUTE
-            request.query = 'SELECT id,name,email FROM users WHERE id = 2'
             response = self.execute_prepare_query(request, client)
 
         elif request.command == COM_STMT_CLOSE: # COM_STMT_CLOSE
             client.prepare = None
-            response = None
+            response = b''
 
         # SQL実行以外は一律OKパケットを応答
         else:
@@ -186,6 +184,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         if result['state']:
             # ERR_Packetを返却
             logging.info('--> Error')
+            logging.info(result)
             return ErrorPacket(seq).make(result['code'], result['state'], result['message'])
 
         # カラム数がない場合はOKパケット返信
@@ -244,7 +243,8 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             body.extend(FieldPacket(seq).make(client, col))
 
         # intermediate eof
-        body.extend(EofPacket(seq).make())
+        if 0 < num_params:
+            body.extend(EofPacket(seq).make())
         # field packet
         # num_columnsと一致させる
         # 結果セットを返すクエリーなのに0だとドライバー側でパケット解析に失敗しエラーになる
@@ -411,7 +411,11 @@ class ErrorPacket(Packet):
 
         self.extend(struct.pack('<B', 0x23)) # sql_state_marker 0x23(#)固定
         self.extend(state.encode()) # sql_state
-        self.extend(message.encode())# error_message
+        # error_message
+        if message:
+            self.extend(message.encode())
+        else:
+            self.extend('Unkown Error.'.encode())
 
         return self.pack()
 
@@ -517,18 +521,21 @@ class BinaryRowPacket(Packet):
             ntype = col['native_type']
             if ntype == 'LONGLONG': # 8 bytes
                 self.extend(struct.pack('<Q', int(data)))
-            elif ntype == 'LONG': # 4 bytes
+            elif ntype in ['LONG', 'INT24']: # 4 bytes
                 self.extend(struct.pack('<I', int(data)))
-            elif ntype == 'SHORT' or ntype == 'YEAR': # 2 bytes
+            elif ntype in ['SHORT', 'YEAR']: # 2 bytes
                 self.extend(struct.pack('<H', int(data)))
             elif ntype == 'TINY': # 1 bytes
                 self.extend(struct.pack('<B', int(data)))
-
-            elif ntype == 'VAR_STRING':
+            elif ntype in ['STRING', 'VARCHAR', 'VAR_STRING', 'ENUM', 'SET', \
+                            'LONG_BLOB', 'MEDIUM_BLOB', 'BLOB', 'TINY_BLOB', 'GEOMETRY', \
+                            'BIT', 'DECIMAL', 'NEWDECIMAL', 'JSON']:
                 self.extend(self.string_lenenc(data))
 
-            elif ntype == 'TIMESTAMP':
+            elif ntype in ['DATE', 'DATETIME', 'TIMESTAMP']:
                 self.make_timestamp(data)
+            elif ntype in ['TIME']:
+                self.make_time(data)
 
             else:
                 logging.error('BinaryRowPacket:not type -> ' + ntype)
@@ -576,6 +583,18 @@ class BinaryRowPacket(Packet):
         else:
             self.extend(struct.pack('<B', 0))
             logging.warn('Unmatch timestamp:' + data)
+
+    def make_time(self, data):
+        tsize = len(data)
+        if tsize == 8: # 00:00:00
+            values = data.split(':')
+            self.extend(struct.pack('<BBI', 8, 1, 0)) # size, is_negative, days
+            self.extend(struct.pack('<BBB', int(values[0]), int(values[1]), int(values[2]))) # hour,minute, second
+
+        else:
+            self.extend(struct.pack('<B', 0))
+            logging.warn('Unmatch time:' + data)
+
 
 
 # PREPARE Response
@@ -700,20 +719,36 @@ class Request(object):
 
         elif self.command == COM_STMT_EXECUTE: # COM_STMT_EXECUTE
             logging.info('<-- COM_STMT_EXECUT')
+            
             protcol = protcol[1:]
             statement_id, self.flags, iteration_count = struct.unpack('<IBI', protcol[0:9])
             protcol = protcol[9:]
             # ここで条件によってはparameter_countが入る
             # https://dev.mysql.com/doc/dev/mysql-server/9.3.0/page_protocol_com_stmt_execute.html
-            # fillerを読み飛ばし
-            protcol = protcol[1:]
-            new_params_bind_flag = protcol[0]
-            protcol = protcol[1:]
+            if client.query_attributes:
+                parameter_count = protcol[0]
+                protcol = protcol[1:]
+
+
             self.binds = []
             bind_types = []
+            num_params = client.prepare['num_params']
+            # パラメータ数が0なら終了
+            if not num_params:
+                return
             
+            # nulls
+            nulllen = int((num_params + 7) / 8)
+            nulls = [0 for i in range(nulllen)]
+            for i in range(nulllen):
+                nulls[i] = protcol[i]
+            protcol = protcol[nulllen:]
+            # new_params_bind_flag
+            new_params_bind_flag = protcol[0]
+            protcol = protcol[1:]
+
             # 最初にデータ型がnum_params分格納
-            for i in range(client.prepare['num_params']):
+            for i in range(num_params):
                 if not len(protcol):
                     logging.error('COM_STMT_EXECUTE binds data type is short.')
                     break
@@ -723,19 +758,29 @@ class Request(object):
                 protcol = protcol[2:]
 
             # 続いて値がnum_params分格納
-            for i in range(client.prepare['num_params']):
+            for i in range(num_params):
+                # is null?
+                byte_pos = int(i / 8)
+                bit_pos = i % 8
+                # nullフラグが立っていたら読み飛ばし
+                if nulls[byte_pos] & (1 << bit_pos) == 1 << bit_pos:
+                    self.binds.append(None)
+                    continue
+
                 if not len(protcol):
                     logging.error('COM_STMT_EXECUTE binds data value is short.')
                     break
 
-                value, size = self.string_lenenc(protcol)
+                value, size = self.read_value(protcol, bind_types[i])
                 protcol = protcol[size:]
                 self.binds.append(value)
 
+            logging.info(client.prepare)
+            logging.info(self.binds)
 
         
         elif self.command == COM_STMT_CLOSE: # COM_STMT_CLOSE
-            logging.info('<-- COM_STMT_EXECUT')
+            logging.info('<-- COM_STMT_CLOSE')
 
         
         # -- Utility Commands
@@ -750,18 +795,47 @@ class Request(object):
             logging.error(protcol)
             
 
-    def string_lenenc(self, data):
+    def read_value(self, data, ftype):
+        if ftype in [253]: # string
+            return self.read_string_lenenc(data)
+
+        elif ftype in [8]: # longlong
+            return self.read_int(data, 8)
+
+        else:
+            logging.error(f'read_value unkown {ftype}')
+
+        return self.read_string_lenenc(data)
+
+    def read_int(self, data, bits):
+        value = 0
+        size = 0
+        if bits == 8: # longlong
+            size = 8
+            value, = struct.unpack('<q', data[:size])
+            
+
+        return (value, size)
+        
+
+    def read_string_lenenc(self, data):
         if not len(data):
             return ('', 0)
 
-        # @todo size parse
         size = 0
         value = ''
-        if data[0] < 0xfb:
-            size = data[0] + 1
-            value = data[1:size].decode('utf-8')
+        if data[0] == 0xfc:
+            size, = struct.unpack('<H', data[1:3])
+            value = data[3:size+3].decode('utf-8')
+            size += 3
+
+        else:
+            size = data[0]
+            value = data[1:size+1].decode('utf-8')
+            size += 1
 
         return (value, size)
+
 
 
 # ------------------------------------------------------------------
