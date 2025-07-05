@@ -1,11 +1,11 @@
+import asyncio
 import os
-import socket
-import socketserver
 import struct
 import zlib
 import logging
 import configparser
 import datetime
+import re
 
 import json
 import urllib.request
@@ -21,15 +21,12 @@ COM_STMT_EXECUTE = 0x17
 COM_STMT_CLOSE = 0x19
 
 # ------------------------------------------------------------------
-# TCPServer
-class MySQLHTServer(socketserver.TCPServer):
-    allow_reuse_address = True
+class MySQLServerProtocol(asyncio.Protocol):
 
-class MySQLHTHandler(socketserver.BaseRequestHandler):
-
-    def setup(self):
+    def __init__(self, **args):
         # 設定値読み込み
         self.servers = {}
+        self.client = None
         config = configparser.ConfigParser()
         config.read_file(open(CONFIG_FILE_NAME))
 
@@ -55,51 +52,53 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         self.servers[section] = setting
 
 
+    def connection_made(self, transport):
+        peername = transport.get_extra_info('peername')
+        logging.info('Connection from {}'.format(peername))
+        self.transport = transport
 
-    def handle(self):
-        # ---------------------------------------------------------
         # Connection Phase
         # Protocol::HandshakeV10
         handshake = HandshakePacket(Sequence()).make()
         logging.info('--> HandshakeV10')
-        self.request.sendall(handshake)
-        
-        # Protocol::HandshakeResponse41
-        logging.info('<-- HandshakeResponse41')
-        rec = self.request.recv(8192)
-        client = Client(rec)
-        
-        # ユーザー名のセクションがcfgに存在するかチェック
-        if client.vuser in self.servers:
-            logging.info('--> OK')
-            client.set_setting(self.servers[client.vuser])
-            self.request.sendall(OkPacket(Sequence(client.sequence)).make())
-        else:
-            logging.info('--> USER ERROR')
-            error = ErrorPacket(Sequence(client.sequence)) \
-                        .make(1045, 'HY000', 'user not found default.cfg')
-            
-            self.request.sendall(error)
-            logging.info('Close Connection.')
-            return
+        self.transport.write(handshake)
 
-        
+    def data_received(self, rec):
         # ---------------------------------------------------------
-        # Command Phase
-        while True:
-            # クライアントからのコマンド受信
-            rec = self.request.recv(8192)
+        # Connection Phase
+        if not self.client:
+            
+            # Protocol::HandshakeResponse41
+            logging.info('<-- HandshakeResponse41')
+            self.client = Client(rec)
+        
+            # ユーザー名のセクションがcfgに存在するかチェック
+            if self.client.vuser in self.servers:
+                logging.info('--> OK')
+                self.client.set_setting(self.servers[self.client.vuser])
+                self.transport.write(OkPacket(Sequence(self.client.sequence), self.client).make())
+            else:
+                logging.info('--> USER ERROR')
+                error = ErrorPacket(Sequence(self.client.sequence)) \
+                            .make(1045, 'HY000', 'user not found default.cfg')
+                
+                self.transport.write(error)
+                logging.info('Close Connection.')
+                return
+
+        # ---------------------------------------------------------
+        # Command Phase        
+        else:
             # リクエストの解析
-            request = Request(rec, client)
+            request = Request(rec, self.client)
             # コマンドに対応するレスポンス生成
-            response = self.execute_command(request, client)
-            self.request.sendall(response)
+            response = self.execute_command(request, self.client)
+            self.transport.write(response)
 
             if request.command in [COM_QUIT]:
                 logging.info('Bye.')
-                break
-
-        logging.info('Close Connection.')
+                self.transport.close()
+                logging.info('Close Connection.')
 
 
     # コマンドに対応するレスポンス生成
@@ -123,7 +122,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         # SQL実行以外は一律OKパケットを応答
         else:
             logging.info('--> OK')
-            response = OkPacket(Sequence(request.sequence)).make()
+            response = OkPacket(Sequence(request.sequence), client).make()
 
         return response
 
@@ -131,6 +130,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
     # クエリー実行
     def execute_query(self, request, client):
         
+        client.check_transaction(request.query)
         seq = Sequence(request.sequence)
         # proxy.php経由でSQL文実行
         result = self.fetch(client, request.query)
@@ -144,7 +144,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         # カラム数がない場合はOKパケット返信
         if not result['cols']:
             logging.info('--> OK')
-            return OkPacket(seq).make(affected=result['affected'], last_insert_id=result['last_insert_id'])
+            return OkPacket(seq, client).make(affected=result['affected'], last_insert_id=result['last_insert_id'])
         
         logging.info('--> Query Result')
 
@@ -154,11 +154,11 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         
         # field packet
         for col in result['cols']:
-            body.extend(FieldPacket(seq).make(client, col))
+            body.extend(FieldPacket(seq, client).make(col))
 
         # CLIENT_DEPRECATE_EOFがoffならcolとrowの間にokパケットを挟む
         if not client.deprecate_eof:
-            body.extend(OkPacket(seq).make(eof=True))
+            body.extend(OkPacket(seq, client).make(eof=True))
 
         # row packet
         for row in result['rows']:
@@ -167,9 +167,9 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         # intermediate eof
         if not client.deprecate_eof:
             # CLIENT_DEPRECATE_EOFがoffならokパケットで応答
-            body.extend(OkPacket(seq).make(eof=True))
+            body.extend(OkPacket(seq, client).make(eof=True))
         else:
-            body.extend(EofPacket(seq).make())
+            body.extend(EofPacket(seq, client).make())
 
         return body
 
@@ -177,6 +177,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
     # プリペアードステートメント実行
     def execute_prepare_query(self, request, client):
 
+        client.check_transaction(client.prepare['query'])
         seq = Sequence(request.sequence)
         # proxy.php経由でSQL文実行
         result = self.fetch(client, client.prepare['query'], request.binds)
@@ -190,7 +191,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         # カラム数がない場合はOKパケット返信
         if not result['cols']:
             logging.info('--> OK')
-            return OkPacket(seq).make(affected=result['affected'], last_insert_id=result['last_insert_id'])
+            return OkPacket(seq, client).make(affected=result['affected'], last_insert_id=result['last_insert_id'])
         
         logging.info('--> Prepare Result')
 
@@ -200,17 +201,17 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
         
         # field packet
         for col in result['cols']:
-            body.extend(FieldPacket(seq).make(client, col))
+            body.extend(FieldPacket(seq, client).make(col))
 
         # intermediate eof
-        body.extend(EofPacket(seq).make())
+        body.extend(EofPacket(seq, client).make())
 
         # row packet
         for row in result['rows']:
             body.extend(BinaryRowPacket(seq).make(row, result['cols']))
 
         # response eof
-        body.extend(EofPacket(seq).make())
+        body.extend(EofPacket(seq, client).make())
             
 
         return body
@@ -221,6 +222,7 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
 
         logging.info('--> Prepare OK')
 
+        client.check_transaction(request.query)
         seq = Sequence(request.sequence)
 
         body = bytearray()
@@ -234,24 +236,24 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
             'num_params': num_params
         }
         # prepare ok
-        body.extend(PrepareOkPacket(seq).make(client, num_columns, num_params))
+        body.extend(PrepareOkPacket(seq, client).make(num_columns, num_params))
 
         # バインドするカラム数の枠が必要
         # params
         col = {'table':'', 'name':'?', 'len':21, 'native_type':'LONGLONG', 'flags':[], 'precision':0} # ダミーの列定義
         for i in range(num_params):
-            body.extend(FieldPacket(seq).make(client, col))
+            body.extend(FieldPacket(seq, client).make(col))
 
         # intermediate eof
         if 0 < num_params:
-            body.extend(EofPacket(seq).make())
+            body.extend(EofPacket(seq, client).make())
         # field packet
         # num_columnsと一致させる
         # 結果セットを返すクエリーなのに0だとドライバー側でパケット解析に失敗しエラーになる
-        body.extend(FieldPacket(seq).make(client, col))
+        body.extend(FieldPacket(seq, client).make(col))
 
         # response eof
-        body.extend(EofPacket(seq).make())
+        body.extend(EofPacket(seq, client).make())
 
         return body
 
@@ -302,6 +304,9 @@ class MySQLHTHandler(socketserver.BaseRequestHandler):
 
 
 
+
+
+
 # ------------------------------------------------------------------
 class Sequence(object):
     def __init__(self, start=-1):
@@ -315,9 +320,10 @@ class Sequence(object):
 
 
 class Packet(object):
-    def __init__(self, seq):
+    def __init__(self, seq, client=None):
         self.body = bytearray()
         self.seq = seq
+        self.client = client
 
     def extend(self, val):
         self.body.extend(val)
@@ -398,7 +404,7 @@ class OkPacket(Packet):
         self.extend(struct.pack('<B', affected)) # affected rows
         self.extend(struct.pack('<B', last_insert_id)) # last insert-id
 
-        self.extend(struct.pack('<H', 2)) # SERVER_STATUS_flags_enum
+        self.extend(struct.pack('<H', 2 + self.client.in_transaction)) # SERVER_STATUS_flags_enum
         self.extend(struct.pack('<H', 0)) # number of warnings
 
         return self.pack()
@@ -430,11 +436,11 @@ class ColumnCountPacket(Packet):
 
 # 列名情報
 class FieldPacket(Packet):
-    def make(self, client, col):
+    def make(self, col):
         # catalog
         self.extend(self.string_lenenc('def')) # def固定
         # schema
-        self.extend(self.string_lenenc(client.database)) # selectを実行したデータベース名と一致させる
+        self.extend(self.string_lenenc(self.client.database)) # selectを実行したデータベース名と一致させる
         # table
         self.extend(self.string_lenenc(col['table']))
         # org_table
@@ -599,7 +605,7 @@ class BinaryRowPacket(Packet):
 
 # PREPARE Response
 class PrepareOkPacket(Packet):
-    def make(self, client, num_columns, num_params):
+    def make(self, num_columns, num_params):
         self.extend(struct.pack('<B', 0x00)) # ok 0x00
         self.extend(struct.pack('<I', 1)) # statement_id
         self.extend(struct.pack('<H', num_columns)) # num_columns
@@ -608,7 +614,7 @@ class PrepareOkPacket(Packet):
 
         self.extend(struct.pack('<H', 0)) # warning_count
 
-        if client.resultset_metadata:
+        if self.client.resultset_metadata:
             self.extend(struct.pack('<B', 0)) # metadata_follows
 
         return self.pack()    
@@ -619,7 +625,7 @@ class EofPacket(Packet):
         # eof
         self.extend(struct.pack('<B', 0xfe)) # eof 0xFE
         self.extend(struct.pack('<H', 0)) # affected_rows
-        self.extend(struct.pack('<H', 2)) # SERVER_STATUS_flags_enum
+        self.extend(struct.pack('<H', 2 + self.client.in_transaction)) # SERVER_STATUS_flags_enum
         #self.extend(struct.pack('<H', 0)) # number of warnings
 
         return self.pack()
@@ -632,6 +638,7 @@ class Client(object):
     def __init__(self, packet):
         self.parse(packet)
         self.prepare = None
+        self.in_transaction = 0
 
     def parse(self, packet):
         # 3byte size
@@ -676,6 +683,13 @@ class Client(object):
     def set_setting(self, setting):
         for k, v in setting.items():
             setattr(self, k, v)
+
+    def check_transaction(self, query):
+        query = query.strip()
+        if re.match('^START +TRANSACTION', query, re.I):
+            self.in_transaction = 1
+        elif re.match('^COMMIT', query, re.I):
+            self.in_transaction = 0
 
 
 # クライアントからのリクエスト解析
@@ -838,33 +852,35 @@ class Request(object):
 
 
 
+
+
 # ------------------------------------------------------------------
-def main():
+async def main():
     HOST, PORT = '0.0.0.0', 13306
 
+    loop = asyncio.get_running_loop()
+    server = await loop.create_server(MySQLServerProtocol, HOST, PORT)
+
+    logging.info(f'Listen {HOST}:{PORT}.')
+
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == '__main__':
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s %(levelname)s %(message)s"
     )
 
-    with MySQLHTServer((HOST, PORT), MySQLHTHandler) as server:
-        try:
-            logging.info(f'Listen {HOST}:{PORT}.')
-            server.serve_forever()
-        
-        except KeyboardInterrupt:
-            pass
-        except Exception as e:
-            logging.error(e)
-        
-        server.server_close()
-        logging.info('Close server.')
-
-
-if __name__ == '__main__':
     if not os.path.exists(CONFIG_FILE_NAME):
         logging.error(f'設定ファイル{CONFIG_FILE_NAME}が見つかりません')
         exit()
     
-    main()
-    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info('Close server.')
+        pass
+
+
