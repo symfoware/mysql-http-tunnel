@@ -89,10 +89,17 @@ class MySQLServerProtocol(asyncio.Protocol):
         # ---------------------------------------------------------
         # Command Phase        
         else:
-            # リクエストの解析
-            request = Request(rec, self.client)
-            # コマンドに対応するレスポンス生成
-            response = self.execute_command(request, self.client)
+            response = bytearray()
+            while len(rec):
+                # リクエストの解析
+                request = Request(rec, self.client)
+                # コマンドに対応するレスポンス生成
+                res = self.execute_command(request, self.client)
+                response.extend(res)
+
+                rec = rec[4+request.packet_size:]
+
+            
             self.transport.write(response)
 
             if request.command in [COM_QUIT]:
@@ -117,7 +124,7 @@ class MySQLServerProtocol(asyncio.Protocol):
 
         elif request.command == COM_STMT_CLOSE: # COM_STMT_CLOSE
             client.prepare = None
-            response = b''
+            response = bytearray()
 
         # SQL実行以外は一律OKパケットを応答
         else:
@@ -703,10 +710,10 @@ class Request(object):
             return
 
         # 3byte size
-        packet_size, = struct.unpack('<I', packet[:3] + b'\x00')
+        self.packet_size, = struct.unpack('<I', packet[:3] + b'\x00')
         # 1byte sequence
         self.sequence = packet[3]
-        protcol = packet[4:4+packet_size]
+        protcol = packet[4:4+self.packet_size]
         
         # 1byte command
         self.command = protcol[0]
